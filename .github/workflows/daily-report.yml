@@ -1,0 +1,50 @@
+name: Daily USD Economic News Report
+
+on:
+  schedule:
+    # Runs every trading day at 13:30 UTC = 8:30 AM ET (30 min before Nasdaq open)
+    # Note: GitHub Actions uses UTC. 8:30 AM ET = 13:30 UTC (during standard time)
+    # For daylight saving (EDT), adjust manually if needed.
+    - cron: '30 13 * * 1-5'   # Monday-Friday at 13:30 UTC
+  workflow_dispatch:          # Manual trigger support
+
+jobs:
+  send-daily-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Daily USD Economic News Report
+        env:
+          SARVAM_API_KEY: ${{ secrets.SARVAM_API_KEY }}
+          SMTP_EMAIL: ${{ secrets.SMTP_EMAIL }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          cd src
+          python main.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: automation-logs-${{ github.run_id }}
+          path: |
+            src/*.log
+          retention-days: 7
