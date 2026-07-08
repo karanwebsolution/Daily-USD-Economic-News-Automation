@@ -65,50 +65,59 @@ class NewsFetcher:
         soup = BeautifulSoup(response.content, "html.parser")
         events = []
 
-        # ForexFactory table structure: rows with class 'calendar_row'
-        rows = soup.find_all("tr", class_="calendar_row")
+        # Try multiple possible row selectors (Forex Factory changes classes often)
+        rows = soup.find_all("tr", class_="calendar__row") or \
+               soup.find_all("tr", class_="calendar_row") or \
+               soup.find_all("tr", {"data-event-id": True})
+
+        logger.info(f"Found {len(rows)} total calendar rows on the page")
 
         for row in rows:
             try:
                 # Currency
-                currency_cell = row.find("td", class_="currency")
+                currency_cell = row.find("td", class_="calendar__currency") or \
+                                row.find("td", class_="currency")
                 if not currency_cell:
                     continue
+                    
                 currency = currency_cell.get_text(strip=True).upper()
-
                 if currency != "USD":
                     continue
 
                 # Time
-                time_cell = row.find("td", class_="time")
+                time_cell = row.find("td", class_="calendar__time") or \
+                            row.find("td", class_="time")
                 time_str = time_cell.get_text(strip=True) if time_cell else "N/A"
 
-                # Impact
-                impact_cell = row.find("td", class_="impact")
+                # Impact detection (more robust)
                 impact = "low"
+                impact_cell = row.find("td", class_="calendar__impact") or \
+                              row.find("td", class_="impact")
+                
                 if impact_cell:
-                    impact_span = impact_cell.find("span")
+                    impact_span = impact_cell.find("span") or impact_cell.find("i")
                     if impact_span:
-                        impact_class = impact_span.get("class", [])
-                        if any("red" in c.lower() for c in impact_class):
+                        classes = " ".join(impact_span.get("class", []))
+                        if "red" in classes.lower() or "high" in classes.lower():
                             impact = "high"
-                        elif any("orange" in c.lower() for c in impact_class):
+                        elif "orange" in classes.lower() or "medium" in classes.lower():
                             impact = "medium"
 
                 # Event name
-                event_cell = row.find("td", class_="event")
+                event_cell = row.find("td", class_="calendar__event") or \
+                             row.find("td", class_="event")
                 event_name = event_cell.get_text(strip=True) if event_cell else "Unknown Event"
 
                 # Actual / Forecast / Previous
-                actual_cell = row.find("td", class_="actual")
-                forecast_cell = row.find("td", class_="forecast")
-                previous_cell = row.find("td", class_="previous")
+                actual_cell = row.find("td", class_="calendar__actual") or row.find("td", class_="actual")
+                forecast_cell = row.find("td", class_="calendar__forecast") or row.find("td", class_="forecast")
+                previous_cell = row.find("td", class_="calendar__previous") or row.find("td", class_="previous")
 
                 actual = actual_cell.get_text(strip=True) if actual_cell else ""
                 forecast = forecast_cell.get_text(strip=True) if forecast_cell else ""
                 previous = previous_cell.get_text(strip=True) if previous_cell else ""
 
-                # Skip low impact unless high/medium
+                # Only include medium and high impact events
                 if impact == "low":
                     continue
 
@@ -127,7 +136,7 @@ class NewsFetcher:
                 logger.warning(f"Error parsing row: {str(e)}")
                 continue
 
-        logger.info(f"Fetched {len(events)} USD events for {date_str}")
+        logger.info(f"Fetched {len(events)} USD high/medium impact events for {date_str}")
         return events
 
     def get_usd_events_today(self) -> List[Dict]:
