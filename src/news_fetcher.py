@@ -1,35 +1,45 @@
 import requests
-from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from typing import List, Dict, Optional
 from logger import logger
 from config import config
 
+
 class NewsFetcher:
+    """
+    Fetches today's USD economic events using ForexFactory's public JSON
+    calendar feed. This replaces the old HTML-scraping approach, which
+    broke because forexfactory.com serves its calendar via JavaScript
+    behind Cloudflare — a plain `requests` GET never sees the actual
+    event rows, so every run silently fell back to "no events".
+
+    The feed below is the same data ForexFactory's own calendar widget
+    uses, published as static JSON (no auth, no JS rendering needed):
+    https://nfs.faireconomy.media/ff_calendar_thisweek.json
+    """
+
+    FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
+            "Accept": "application/json",
         })
         self.ny_tz = pytz.timezone("America/New_York")
 
     def is_trading_day(self, date: datetime) -> bool:
         """Check if it's a weekday (basic trading day check)."""
-        # Monday=0 ... Friday=4
         if date.weekday() >= 5:
             return False
-        # Basic US holiday skip (can be expanded)
         holidays = [
             (1, 1),   # New Year's Day
             (7, 4),   # Independence Day
             (12, 25), # Christmas
             (11, 11), # Veterans Day (approx)
         ]
-        month_day = (date.month, date.day)
-        if month_day in holidays:
+        if (date.month, date.day) in holidays:
             return False
         return True
 
@@ -37,9 +47,20 @@ class NewsFetcher:
         """Get current date in New York timezone."""
         return datetime.now(self.ny_tz)
 
+    def _parse_event_time(self, raw_date: str) -> Optional[datetime]:
+        """Parse the feed's ISO8601 date string into a NY-aware datetime."""
+        if not raw_date:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            return dt.astimezone(self.ny_tz)
+        except (ValueError, TypeError):
+            return None
+
     def fetch_forex_factory_calendar(self, target_date: Optional[datetime] = None) -> List[Dict]:
         """
-        Scrape Forex Factory calendar for today's USD events.
+        Pull this week's calendar from the JSON feed and filter down to
+        today's USD medium/high impact events.
         Returns list of dicts with keys: time, currency, impact, event, actual, forecast, previous
         """
         if target_date is None:
@@ -49,94 +70,56 @@ class NewsFetcher:
             logger.info("Not a trading day. Skipping news fetch.")
             return []
 
-        # ForexFactory uses date format YYYY-MM-DD in URL
-        date_str = target_date.strftime("%Y-%m-%d")
-        url = f"https://www.forexfactory.com/calendar?day={date_str}"
-
-        logger.info(f"Fetching economic calendar from ForexFactory for {date_str}")
+        logger.info(f"Fetching economic calendar feed for {target_date.strftime('%Y-%m-%d')}")
 
         try:
-            response = self.session.get(url, timeout=20)
+            response = self.session.get(self.FEED_URL, timeout=20)
             response.raise_for_status()
+            raw_events = response.json()
         except requests.RequestException as e:
-            logger.error(f"Failed to fetch calendar: {str(e)}")
+            logger.error(f"Failed to fetch calendar feed: {str(e)}")
+            raise
+        except ValueError as e:
+            logger.error(f"Failed to parse calendar feed JSON: {str(e)}")
             raise
 
-        soup = BeautifulSoup(response.content, "html.parser")
+        logger.info(f"Fetched {len(raw_events)} total events from feed")
+
+        target_date_str = target_date.strftime("%Y-%m-%d")
         events = []
 
-        # Try multiple possible row selectors (Forex Factory changes classes often)
-        rows = soup.find_all("tr", class_="calendar__row") or \
-               soup.find_all("tr", class_="calendar_row") or \
-               soup.find_all("tr", {"data-event-id": True})
-
-        logger.info(f"Found {len(rows)} total calendar rows on the page")
-
-        for row in rows:
+        for item in raw_events:
             try:
-                # Currency
-                currency_cell = row.find("td", class_="calendar__currency") or \
-                                row.find("td", class_="currency")
-                if not currency_cell:
-                    continue
-                    
-                currency = currency_cell.get_text(strip=True).upper()
+                currency = (item.get("country") or "").upper()
                 if currency != "USD":
                     continue
 
-                # Time
-                time_cell = row.find("td", class_="calendar__time") or \
-                            row.find("td", class_="time")
-                time_str = time_cell.get_text(strip=True) if time_cell else "N/A"
+                event_dt = self._parse_event_time(item.get("date"))
+                if event_dt is None or event_dt.strftime("%Y-%m-%d") != target_date_str:
+                    continue
 
-                # Impact detection (more robust)
-                impact = "low"
-                impact_cell = row.find("td", class_="calendar__impact") or \
-                              row.find("td", class_="impact")
-                
-                if impact_cell:
-                    impact_span = impact_cell.find("span") or impact_cell.find("i")
-                    if impact_span:
-                        classes = " ".join(impact_span.get("class", []))
-                        if "red" in classes.lower() or "high" in classes.lower():
-                            impact = "high"
-                        elif "orange" in classes.lower() or "medium" in classes.lower():
-                            impact = "medium"
-
-                # Event name
-                event_cell = row.find("td", class_="calendar__event") or \
-                             row.find("td", class_="event")
-                event_name = event_cell.get_text(strip=True) if event_cell else "Unknown Event"
-
-                # Actual / Forecast / Previous
-                actual_cell = row.find("td", class_="calendar__actual") or row.find("td", class_="actual")
-                forecast_cell = row.find("td", class_="calendar__forecast") or row.find("td", class_="forecast")
-                previous_cell = row.find("td", class_="calendar__previous") or row.find("td", class_="previous")
-
-                actual = actual_cell.get_text(strip=True) if actual_cell else ""
-                forecast = forecast_cell.get_text(strip=True) if forecast_cell else ""
-                previous = previous_cell.get_text(strip=True) if previous_cell else ""
-
-                # Only include medium and high impact events
-                if impact == "low":
+                impact = (item.get("impact") or "").strip().lower()
+                if impact not in ("high", "medium"):
                     continue
 
                 events.append({
-                    "time": time_str,
+                    "time": event_dt.strftime("%I:%M %p").lstrip("0") or "N/A",
                     "currency": currency,
                     "impact": impact,
-                    "event": event_name,
-                    "actual": actual or None,
-                    "forecast": forecast or None,
-                    "previous": previous or None,
-                    "date": date_str,
+                    "event": item.get("title", "Unknown Event"),
+                    "actual": item.get("actual") or None,
+                    "forecast": item.get("forecast") or None,
+                    "previous": item.get("previous") or None,
+                    "date": target_date_str,
                 })
-
             except Exception as e:
-                logger.warning(f"Error parsing row: {str(e)}")
+                logger.warning(f"Error parsing feed item: {str(e)}")
                 continue
 
-        logger.info(f"Fetched {len(events)} USD high/medium impact events for {date_str}")
+        # Sort chronologically
+        events.sort(key=lambda e: e["time"])
+
+        logger.info(f"Found {len(events)} USD high/medium impact events for {target_date_str}")
         return events
 
     def get_usd_events_today(self) -> List[Dict]:
